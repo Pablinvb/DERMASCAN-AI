@@ -15,6 +15,9 @@ def synthetic_image() -> bytes:
     cv2.circle(image, (300, 390), 15, (35, 40, 48), -1)
     cv2.circle(image, (420, 390), 15, (35, 40, 48), -1)
     cv2.line(image, (315, 550), (405, 550), (65, 70, 115), 8)
+    cv2.circle(image, (275, 500), 18, (65, 75, 235), -1)
+    cv2.circle(image, (445, 510), 15, (70, 80, 225), -1)
+    cv2.circle(image, (420, 580), 22, (75, 105, 125), -1)
     ok, encoded = cv2.imencode(".jpg", image)
     assert ok
     return encoded.tobytes()
@@ -59,6 +62,25 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertFalse(body["imageStored"])
         self.assertEqual(len(body["result"]["metrics"]), 8)
+        self.assertTrue(body["result"]["attentionMap"]["derivedFromImage"])
+        self.assertEqual(
+            body["result"]["attentionMap"]["zoneCount"],
+            len(body["result"]["attentionZones"]),
+        )
+        self.assertGreater(len(body["result"]["attentionZones"]), 0)
+        for zone in body["result"]["attentionZones"]:
+            self.assertGreaterEqual(zone["x"], 0)
+            self.assertLessEqual(zone["x"], 1)
+            self.assertGreaterEqual(zone["y"], 0)
+            self.assertLessEqual(zone["y"], 1)
+            self.assertIn(zone["type"], {"redness", "pigmentation", "texture"})
+        self.assertTrue(
+            any(
+                abs(zone["x"] - 0.38) < 0.07 and abs(zone["y"] - 0.55) < 0.07
+                for zone in body["result"]["attentionZones"]
+            ),
+            "El mapa no localizó la variación controlada de la mejilla izquierda.",
+        )
         self.assertIsNotNone(body["analysisId"])
 
         history = self.client.get("/api/v1/history", headers=self.headers)

@@ -42,6 +42,8 @@ en `.env.example`.
   líneas visibles, enrojecimiento y balance sebáceo.
 - Clasificación cosmética orientativa del tipo de piel.
 - Mapa facial, prioridades y rutina inicial.
+- Mapa facial basado en componentes visuales detectados en la fotografía:
+  coordenadas reales de variaciones localizadas de rojez, tono y microtextura.
 - Historial opcional por sesión; guarda resultados, nunca fotografías.
 - Límites de resolución y frecuencia, respuestas estructuradas y CORS.
 

@@ -38,6 +38,7 @@ class SkinAnalyzer:
 
     def analyze(self, image_bgr: np.ndarray) -> dict[str, Any]:
         image_bgr = self._normalize_size(image_bgr)
+        image_height, image_width = image_bgr.shape[:2]
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         faces = self.face_detector.detectMultiScale(
             gray,
@@ -55,11 +56,17 @@ class SkinAnalyzer:
             face = image_bgr[y : y + height, x : x + width]
             detection_mode = "face-detected"
         else:
-            face = self._center_face_crop(image_bgr)
+            x, y, width, height = self._center_face_box(image_bgr)
+            face = image_bgr[y : y + height, x : x + width]
             detection_mode = "guided-fallback"
 
         quality = self._quality(image_bgr, face)
         signals = self._skin_signals(face)
+        attention_zones = self._attention_zones(
+            face,
+            (x, y, width, height),
+            (image_width, image_height),
+        )
         metrics = self._metrics(signals)
         weights = [0.15, 0.20, 0.15, 0.20, 0.15, 0.15]
         overall = round(sum(item["score"] * weights[index] for index, item in enumerate(metrics[:6])))
@@ -100,6 +107,19 @@ class SkinAnalyzer:
                 "detected": bool(face_count),
                 "count": face_count,
                 "mode": detection_mode,
+                "box": {
+                    "x": round(x / image_width, 4),
+                    "y": round(y / image_height, 4),
+                    "width": round(width / image_width, 4),
+                    "height": round(height / image_height, 4),
+                },
+            },
+            "attentionZones": attention_zones,
+            "attentionMap": {
+                "derivedFromImage": True,
+                "coordinateSpace": "normalized-original-image",
+                "method": "local-color-and-microcontrast-v1",
+                "zoneCount": len(attention_zones),
             },
             "warnings": warnings,
             "engine": {
@@ -132,11 +152,11 @@ class SkinAnalyzer:
         return x1, y1, x2 - x1, y2 - y1
 
     @staticmethod
-    def _center_face_crop(image: np.ndarray) -> np.ndarray:
+    def _center_face_box(image: np.ndarray) -> tuple[int, int, int, int]:
         height, width = image.shape[:2]
         x1, x2 = round(width * 0.20), round(width * 0.80)
         y1, y2 = round(height * 0.10), round(height * 0.78)
-        return image[y1:y2, x1:x2]
+        return x1, y1, x2 - x1, y2 - y1
 
     @staticmethod
     def _quality(image: np.ndarray, face: np.ndarray) -> dict[str, float]:
@@ -191,6 +211,230 @@ class SkinAnalyzer:
             "pigmentationNeed": pigmentation,
             "lineNeed": lines,
         }
+
+    def _attention_zones(
+        self,
+        face: np.ndarray,
+        face_box: tuple[int, int, int, int],
+        image_size: tuple[int, int],
+    ) -> list[dict[str, Any]]:
+        """Locate visible pixel anomalies and return their real image positions.
+
+        These detections describe photographic signals (relative redness,
+        localized darkness and microcontrast). They do not identify lesions or
+        diseases. Every returned point comes from a connected component in the
+        submitted image; no template coordinates are used.
+        """
+        face_height, face_width = face.shape[:2]
+        if face_height < 80 or face_width < 80:
+            return []
+
+        mask = self._facial_skin_mask(face_width, face_height)
+        lab = cv2.cvtColor(face, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lightness, red_green, _ = cv2.split(lab)
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        blur_size = self._odd_kernel(max(21, round(min(face_width, face_height) * 0.11)))
+        local_light = cv2.GaussianBlur(lightness, (blur_size, blur_size), 0)
+        local_red = cv2.GaussianBlur(red_green, (blur_size, blur_size), 0)
+        local_gray = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+
+        relative_redness = red_green - local_red
+        localized_darkness = local_light - lightness
+        microcontrast = cv2.absdiff(gray, local_gray)
+
+        maps = [
+            {
+                "type": "redness",
+                "label": "Enrojecimiento visible",
+                "color": "#e96f61",
+                "map": relative_redness,
+                "percentile": 94.5,
+                "absolute": 3.5,
+                "min_area": 8,
+                "max_area_ratio": 0.06,
+                "evidence": "Variación rojiza localizada respecto a la piel cercana",
+            },
+            {
+                "type": "pigmentation",
+                "label": "Variación de tono",
+                "color": "#9574cf",
+                "map": localized_darkness,
+                "percentile": 95.0,
+                "absolute": 7.0,
+                "min_area": 10,
+                "max_area_ratio": 0.08,
+                "evidence": "Zona más oscura que su entorno inmediato",
+            },
+            {
+                "type": "texture",
+                "label": "Microtextura visible",
+                "color": "#e4b648",
+                "map": microcontrast,
+                "percentile": 96.0,
+                "absolute": 9.0,
+                "min_area": 6,
+                "max_area_ratio": 0.035,
+                "evidence": "Contraste fino localizado en la superficie visible",
+            },
+        ]
+
+        zones: list[dict[str, Any]] = []
+        for definition in maps:
+            zones.extend(
+                self._extract_hotspots(
+                    definition,
+                    mask,
+                    face_box,
+                    image_size,
+                    max_zones=3,
+                )
+            )
+
+        zones.sort(key=lambda item: item["severity"], reverse=True)
+        return self._deduplicate_zones(zones, maximum=8)
+
+    @staticmethod
+    def _facial_skin_mask(width: int, height: int) -> np.ndarray:
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.ellipse(
+            mask,
+            (round(width * 0.50), round(height * 0.48)),
+            (round(width * 0.41), round(height * 0.43)),
+            0,
+            0,
+            360,
+            255,
+            -1,
+        )
+        # Exclude eyes, eyebrows, nostrils and lips: their natural contrast
+        # should not become a skin finding.
+        for center, axes in [
+            ((0.31, 0.38), (0.16, 0.09)),
+            ((0.69, 0.38), (0.16, 0.09)),
+            ((0.50, 0.57), (0.10, 0.08)),
+            ((0.50, 0.72), (0.20, 0.09)),
+        ]:
+            cv2.ellipse(
+                mask,
+                (round(width * center[0]), round(height * center[1])),
+                (round(width * axes[0]), round(height * axes[1])),
+                0,
+                0,
+                360,
+                0,
+                -1,
+            )
+        mask[: round(height * 0.10), :] = 0
+        mask[round(height * 0.84) :, :] = 0
+        return mask
+
+    @staticmethod
+    def _odd_kernel(value: int) -> int:
+        return value if value % 2 else value + 1
+
+    def _extract_hotspots(
+        self,
+        definition: dict[str, Any],
+        mask: np.ndarray,
+        face_box: tuple[int, int, int, int],
+        image_size: tuple[int, int],
+        max_zones: int,
+    ) -> list[dict[str, Any]]:
+        score_map = definition["map"]
+        valid_values = score_map[mask > 0]
+        if valid_values.size < 100:
+            return []
+        threshold = max(
+            float(definition["absolute"]),
+            float(np.percentile(valid_values, definition["percentile"])),
+        )
+        binary = ((score_map >= threshold) & (mask > 0)).astype(np.uint8) * 255
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+        face_area = mask.shape[0] * mask.shape[1]
+        max_area = face_area * definition["max_area_ratio"]
+        x0, y0, face_width, face_height = face_box
+        image_width, image_height = image_size
+        candidates: list[dict[str, Any]] = []
+
+        for component in range(1, count):
+            area = int(stats[component, cv2.CC_STAT_AREA])
+            if area < definition["min_area"] or area > max_area:
+                continue
+            component_values = score_map[labels == component]
+            peak = float(np.percentile(component_values, 90))
+            severity = round(clamp(35 + (peak - threshold) * 6 + np.sqrt(area) * 1.8))
+            cx, cy = centroids[component]
+            component_width = int(stats[component, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[component, cv2.CC_STAT_HEIGHT])
+            # Long thin components usually represent the jaw/hair boundary,
+            # compression seams or shadows, rather than localized skin signals.
+            if (
+                component_width > face_width * 0.28
+                or component_height > face_height * 0.28
+            ):
+                continue
+            radius_pixels = max(7.0, max(component_width, component_height) * 0.65)
+            absolute_x = x0 + float(cx)
+            absolute_y = y0 + float(cy)
+            candidates.append(
+                {
+                    "type": definition["type"],
+                    "label": definition["label"],
+                    "color": definition["color"],
+                    "x": round(absolute_x / image_width, 4),
+                    "y": round(absolute_y / image_height, 4),
+                    "radius": round(radius_pixels / max(image_width, image_height), 4),
+                    "severity": severity,
+                    "level": (
+                        "alta" if severity >= 75 else "media" if severity >= 50 else "leve"
+                    ),
+                    "facialRegion": self._facial_region(float(cx), float(cy), face_width, face_height),
+                    "evidence": definition["evidence"],
+                }
+            )
+        candidates.sort(key=lambda item: item["severity"], reverse=True)
+        return candidates[:max_zones]
+
+    @staticmethod
+    def _deduplicate_zones(
+        zones: list[dict[str, Any]], maximum: int
+    ) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        for zone in zones:
+            overlaps = any(
+                np.hypot(zone["x"] - current["x"], zone["y"] - current["y"])
+                < max(zone["radius"], current["radius"]) * 1.35
+                for current in selected
+            )
+            if not overlaps:
+                selected.append(zone)
+            if len(selected) == maximum:
+                break
+        return selected
+
+    @staticmethod
+    def _facial_region(x: float, y: float, width: int, height: int) -> str:
+        nx, ny = x / width, y / height
+        if ny < 0.34:
+            return "frente"
+        if ny > 0.75:
+            return "mentón"
+        if nx < 0.42:
+            return "mejilla izquierda"
+        if nx > 0.58:
+            return "mejilla derecha"
+        return "zona central"
 
     @staticmethod
     def _region(

@@ -368,6 +368,7 @@
       renderResults(lastAnalysis);
       await wait(260);
       showStage("results");
+      requestAnimationFrame(() => drawMap(lastAnalysis));
     } catch (error) {
       showStage("capture");
       cameraStatus.textContent = error.message || "No pudimos procesar la imagen.";
@@ -449,7 +450,6 @@
       </div>
     `).join("");
 
-    drawMap(result);
   }
 
   function summaryFor(result) {
@@ -491,24 +491,59 @@
       const c = canvas.getContext("2d");
       c.scale(devicePixelRatio, devicePixelRatio);
       const w = rect.width, h = rect.height;
-      const candidates = [
-        { key: "acneNeed", label: "Imperfecciones", color: "#e96f61", points: [[.38,.53],[.63,.57],[.42,.63]] },
-        { key: "poreNeed", label: "Poros", color: "#e4b648", points: [[.35,.48],[.65,.48],[.5,.53]] },
-        { key: "lineNeed", label: "Líneas", color: "#6aa8c9", points: [[.5,.29],[.34,.39],[.66,.39]] },
-        { key: "pigmentationNeed", label: "Pigmentación", color: "#9574cf", points: [[.34,.58],[.67,.56]] },
-      ].filter((item) => result.needs[item.key] > 22);
-      candidates.forEach((group) => {
-        group.points.slice(0, result.needs[group.key] > 58 ? 3 : 2).forEach(([x, y]) => {
-          c.beginPath();
-          c.arc(w * x, h * y, 11, 0, Math.PI * 2);
-          c.fillStyle = `${group.color}55`; c.fill();
-          c.lineWidth = 2; c.strokeStyle = group.color; c.stroke();
-          c.beginPath(); c.arc(w * x, h * y, 3, 0, Math.PI * 2); c.fillStyle = group.color; c.fill();
-        });
+      const zones = Array.isArray(result.attentionZones) ? result.attentionZones : [];
+      const naturalWidth = image.naturalWidth || captureCanvas.width;
+      const naturalHeight = image.naturalHeight || captureCanvas.height;
+      const coverScale = Math.max(w / naturalWidth, h / naturalHeight);
+      const renderedWidth = naturalWidth * coverScale;
+      const renderedHeight = naturalHeight * coverScale;
+      const offsetX = (w - renderedWidth) / 2;
+      const offsetY = (h - renderedHeight) / 2;
+
+      zones.forEach((zone, index) => {
+        const x = offsetX + zone.x * renderedWidth;
+        const y = offsetY + zone.y * renderedHeight;
+        const radius = Math.max(10, zone.radius * Math.max(renderedWidth, renderedHeight));
+        const gradient = c.createRadialGradient(x, y, 2, x, y, radius * 1.7);
+        gradient.addColorStop(0, `${zone.color}88`);
+        gradient.addColorStop(.6, `${zone.color}36`);
+        gradient.addColorStop(1, `${zone.color}00`);
+        c.beginPath();
+        c.arc(x, y, radius * 1.7, 0, Math.PI * 2);
+        c.fillStyle = gradient;
+        c.fill();
+        c.beginPath();
+        c.arc(x, y, radius, 0, Math.PI * 2);
+        c.lineWidth = 2;
+        c.strokeStyle = zone.color;
+        c.stroke();
+        c.beginPath();
+        c.arc(x, y, 10, 0, Math.PI * 2);
+        c.fillStyle = zone.color;
+        c.fill();
+        c.fillStyle = "#fff";
+        c.font = "700 10px DM Sans";
+        c.textAlign = "center";
+        c.textBaseline = "middle";
+        c.fillText(String(index + 1), x, y + .5);
       });
-      $("#map-legend").innerHTML = candidates.length
-        ? candidates.map((item) => `<span><i style="background:${item.color}"></i>${item.label}</span>`).join("")
-        : `<span><i style="background:var(--lime-dark)"></i>Sin zonas destacadas</span>`;
+
+      const categories = [...new Map(zones.map((zone) => [zone.type, zone])).values()];
+      $("#map-legend").innerHTML = categories.length
+        ? categories.map((item) => `<span><i style="background:${item.color}"></i>${item.label}</span>`).join("")
+        : `<span><i style="background:var(--lime-dark)"></i>Sin variaciones localizadas sobre el umbral</span>`;
+      $("#map-findings").innerHTML = zones.length
+        ? zones.map((zone, index) => `
+          <div class="map-finding">
+            <span class="map-finding-number" style="background:${zone.color}">${index + 1}</span>
+            <div>
+              <b>${zone.label} · ${zone.facialRegion}</b>
+              <small>${zone.evidence}</small>
+            </div>
+            <small>${zone.level}</small>
+          </div>
+        `).join("")
+        : `<p class="map-empty">El motor no encontró variaciones visuales localizadas con evidencia suficiente en esta captura. Esto no descarta afecciones de la piel.</p>`;
     };
     if (image.complete) setTimeout(render, 80);
     else image.onload = () => setTimeout(render, 80);
