@@ -17,7 +17,13 @@
   const IS_LOCAL = ["127.0.0.1", "localhost"].includes(location.hostname);
   const IS_STATIC_DEPLOYMENT = !IS_LOCAL;
   const API_BASE = window.DERMASCAN_API_URL
-    || (location.port === "8000" ? "" : IS_LOCAL ? "http://127.0.0.1:8000" : "");
+    || (location.hostname === "pablinvb.github.io"
+      ? "https://dermascan-ai-api.onrender.com"
+      : location.port === "8000"
+        ? ""
+        : IS_LOCAL
+          ? "http://127.0.0.1:8000"
+          : "");
   const sessionId = getSessionId();
   let stream = null;
   let imageReady = false;
